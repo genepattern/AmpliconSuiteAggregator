@@ -4,10 +4,8 @@
 # AmpliconClassifier results and aggregates the results.
 ###
 import sys
-import tarfile
 import os
 import re
-import pandas as pd
 import tarfile
 import shutil
 import json
@@ -16,6 +14,10 @@ import ast
 import zipfile
 from collections import defaultdict
 import requests
+import glob
+
+import pandas as pd
+
 
 
 DEST_ROOT = os.path.join("./extracted_from_zips")
@@ -79,8 +81,21 @@ def unzip_file(fp, dest_root):
                 zip_ref.extractall(destination)
             zip_ref.close()
 
+        elif fp.endswith(".tar"):
+            zip_name = os.path.basename(fp).replace(".tar", "")
+            destination = f'{dest_root}/{zip_name}'
+            with tarfile.open(fp, 'r') as output_zip:
+                output_zip.extractall(destination)
+            output_zip.close()
+
+        else:
+            print("File " + fp + " is not a zip or tar file. It may be ignored!")
+
     except Exception as e:
+        print("ERROR WHILE EXTRACTING FILES!")
         print(e)
+        if ":" not in str(e):  # not due to legacy ':' in AA files
+            sys.exit(1)
 
 
 def clean_dirs(dlist):
@@ -112,6 +127,7 @@ class Aggregator:
             self.run_amp_classifier()
         self.samp_AA_dct, self.samp_ckit_dct = defaultdict(str), defaultdict(str)
         self.samp_mdata_dct, self.run_mdata_dct = defaultdict(str), defaultdict(str)
+        self.samp_cnv_calls_dct = defaultdict(str)
         self.locate_dirs_and_metadata_jsons()
         # print(self.samp_ckit_dct)
         # print(self.samp_AA_dct)
@@ -127,6 +143,13 @@ class Aggregator:
         Unzips the zip files, and get directories for files within
 
         """
+
+        # check if either of these directories exists, and if it does, run the command below:
+        for temp_output_dir in ['./results', DEST_ROOT]:
+            if os.path.exists(temp_output_dir):
+                print("Warning: Directory " + temp_output_dir + " already exists! Cleaning now.")
+                clean_dirs([temp_output_dir,])
+
         for zip_fp in self.zip_paths:
             fp = os.path.join(self.root, zip_fp)
             try:
@@ -196,6 +219,7 @@ class Aggregator:
                 elif fp.endswith("_cnvkit_output"):
                     implied_sname = rchop(fp,"_cnvkit_output").rsplit("/")[-1]
                     self.clean_by_suffix(".cnr.gz", fp)
+                    self.clean_by_suffix(".cnr", fp)
                     cmd = f'gzip -fq {fp}/*.cns 2> /dev/null'
                     subprocess.call(cmd, shell=True)
                     # print(fp.rstrip("_cnvkit_output"), implied_sname)
@@ -209,6 +233,10 @@ class Aggregator:
                     elif f.endswith("_sample_metadata.json"):
                         implied_sname = rchop(f, "_sample_metadata.json")
                         self.samp_mdata_dct[implied_sname] = fp + "/" + f
+
+                    elif f.endswith("_CNV_CALLS.bed"):
+                        implied_sname = rchop(f, "_CNV_CALLS.bed")
+                        self.samp_cnv_calls_dct[implied_sname] = fp + "/" + f
 
     def run_amp_classifier(self):
         """
@@ -257,16 +285,22 @@ class Aggregator:
             AC_SRC = os.environ['AC_SRC']
         except KeyError:
             sys.stderr.write("AC_SRC variable not found! AmpliconClassifier is not properly installed.\n")
+            self.cleanup(failure=True)
             sys.exit(1)
 
         print(f"AC_SRC is set to {AC_SRC}")
-        os.system(f"{AC_SRC}/make_input.sh {OUTPUT_PATH} {OUTPUT_PATH}/{self.output_name}" )
+        input_ec = os.system(f"{AC_SRC}/make_input.sh {OUTPUT_PATH} {OUTPUT_PATH}/{self.output_name}")
+        if input_ec != 0:
+            print("Failed to make input for AC!")
+            self.cleanup(failure=True)
+            sys.exit(1)
 
         ## if reference isn't downloaded already, then download appropriate reference genome
         try:
             local_data_repo = os.environ['AA_DATA_REPO']
         except KeyError:
             sys.stderr.write("AA_DATA_REPO variable not found! The AA data repo directory is not properly configured.\n")
+            self.cleanup(failure=True)
             sys.exit(1)
 
         if not os.path.exists(os.path.join(local_data_repo, self.ref)):
@@ -304,11 +338,13 @@ class Aggregator:
         sample_num = 1
         # aggregate results
         print("Aggregating results into tables")
+        found_res_table = False
         for res_dir in [OUTPUT_PATH, OTHER_FILES]:
             for root, dirs, files in os.walk(res_dir, topdown = False):
                 for name in files:
                     if name.endswith("_result_table.tsv") and not name.startswith("._"):
                         result_table_fp = os.path.join(root, name)
+                        found_res_table = True
                         try:
                             df = pd.read_csv(result_table_fp, delimiter = '\t')
                             aggregate = pd.concat([aggregate, df], ignore_index = True)
@@ -324,6 +360,12 @@ class Aggregator:
                             runs[f'sample_{sample_num}'] = json.loads(group.to_json(orient = 'records'))
                             sample_to_ac_dir[f'sample_{sample_num}'] = os.path.dirname(result_table_fp)
                             sample_num += 1
+
+        if not found_res_table:
+            print("Error: No results tables found! Aggregation will be empty or invalid. Please make sure to first run make_results_table.py from AmpliconClassifier.")
+            self.cleanup(failure=True)
+            sys.exit(1)
+
 
         ## output the table
         with open('./results/run.json', 'w') as run_file:
@@ -350,14 +392,16 @@ class Aggregator:
 
         tar_handle.close()
 
-    def cleanup(self):
+    def cleanup(self, failure=False):
         """
         Zips the aggregate results, and deletes files for cleanup
         """
         clean_dirs(self.samp_AA_dct.values())
         # self.clean_files(self.samp_ckit_dct.values())
-        print("Creating tar.gz...")
-        self.tardir('./results', f'{self.output_name}.tar.gz')
+        if not failure:
+            print("Creating tar.gz...")
+            self.tardir('./results', f'{self.output_name}.tar.gz')
+
         clean_dirs(['./results', DEST_ROOT]) # ./extracted_from_zips
 
     # def find_file(self, basename):
@@ -393,10 +437,13 @@ class Aggregator:
                 # updating string of lists to lists
                 sample_name = sample_dct["Sample name"]
                 ref_genomes.add(sample_dct["Reference version"])
+                if sample_dct["Reference version"] is None:
+                    sys.stderr.write("WARNING: " + sample_name + " had no reference genome build indicated!\n")
                 if len(ref_genomes) > 1:
                     sys.stderr.write(str(ref_genomes) + "\n")
                     sys.stderr.write("ERROR! Multiple reference genomes detected in project.\n AmpliconRepository only "
                                      "supports single-reference projects currently. Exiting.\n")
+                    self.cleanup(failure=True)
                     sys.exit(1)
 
                 potential_str_lsts = [
@@ -445,6 +492,9 @@ class Aggregator:
                         feat_basename = os.path.basename(sample_dct[feature])
                         feat_file = f'{self.sample_to_ac_location_dct[sample]}/files/{feat_basename}'
                         if feature == "CNV BED file" and any([feat_file.endswith(x) for x in ["AA_CNV_SEEDS.bed", "CNV_CALLS_pre_filtered.bed", "Not provided", "Not Provided"]]):
+                            if self.samp_cnv_calls_dct[sample_name]:
+                                feat_file = self.samp_cnv_calls_dct[sample_name]
+
                             cnvkit_dir = self.samp_ckit_dct[sample_dct['Sample name']]
                             if cnvkit_dir:
                                 for f in os.listdir(cnvkit_dir):
@@ -482,6 +532,7 @@ class Aggregator:
                         # clean .out and .cnr.gz files
                         self.clean_by_suffix("*.out", orig_dir)
                         self.clean_by_suffix("*.cnr.gz", orig_dir)
+                        self.clean_by_suffix("*.cnr", orig_dir)
 
                         tarf = orig_dir + ".tar.gz"
                         self.tardir(orig_dir, tarf, keep_root=False)
@@ -513,21 +564,25 @@ class Aggregator:
         aggregate.to_html('./results/aggregated_results.html')
 
     def clean_by_suffix(self, suffix, dir):
-        if suffix and dir and not dir == "/" and not suffix == "*":
+        # Validate inputs
+        if suffix and dir and dir != "/" and suffix != "*":
             if not suffix.startswith("*"):
                 suffix = "*" + suffix
 
-            cmd = f'rm -f {dir}/{suffix}'
-            # try:
-            subprocess.call(cmd, shell=True)
-            # except FileNotFoundError:
-            #     pass
+            # Use glob to safely handle file listing
+            file_pattern = os.path.join(dir, suffix)
+            files_to_remove = glob.glob(file_pattern)
+            for file_path in files_to_remove:
+                try:
+                    os.remove(file_path)
+                except OSError as e:
+                    print(f"Error removing {file_path}: {e}")
 
 
 # TODO: VALIDATE IS NEVER USED!
 def validate():
     """
-    Validates that all of the file locations exist.
+    Validates that all the file locations exist.
     """
     ## check that everything is in the right place
     if os.path.exists('./output'):
